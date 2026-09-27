@@ -738,6 +738,14 @@ pub fn emit_compliance_hold_released(e: &Env, hold_id: u64, released_by: Address
 // Funding Reservation Expiry Events (#337)
 // ═════════════════════════════════════════════════════════════════════════════
 
+/// Emitted when a funding reservation is created for a payroll batch (#337).
+pub fn emit_reservation_created(e: &Env, asset: Address, reserved_amount: i128, expires_at: u64) {
+    e.events().publish(
+        (payroll_topic(), Symbol::new(e, "reservation_created")),
+        (asset, reserved_amount, expires_at),
+    );
+}
+
 /// Emitted when a funding reservation expires (#337).
 pub fn emit_reservation_expired(e: &Env, asset: Address, amount: i128, expired_at: u64) {
     e.events().publish(
