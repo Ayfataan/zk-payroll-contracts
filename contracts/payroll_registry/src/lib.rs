@@ -19,6 +19,7 @@ const STELLAR_ACCOUNT_VERSION_BYTE: u8 = 6 << 3;
 pub struct CompanyInfo {
     pub admin: Address,
     pub treasury: Address,
+    pub revoked: bool,
 }
 
 // ?? Issue #90: employee eligibility ??????????????????????????????????????????
@@ -149,6 +150,10 @@ pub trait PayrollRegistryTrait {
     /// Register a new company. Returns the newly assigned company ID.
     /// Requires authorisation from the provided admin address.
     fn register_company(env: Env, admin: Address, treasury: Address) -> u64;
+
+    /// Revoke the employer/company-admin role for a company while preserving
+    /// the company record and historical payroll state.
+    fn revoke_company_admin(env: Env, company_id: u64, admin: Address);
 
     /// Add an employee commitment under a company.
     /// Requires authorisation from the company admin.
@@ -360,6 +365,9 @@ impl PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         info.admin.require_auth();
 
         let emp = employee.clone();
@@ -493,6 +501,7 @@ impl PayrollRegistryTrait for PayrollRegistry {
         let info = CompanyInfo {
             admin: admin.clone(),
             treasury: treasury.clone(),
+            revoked: false,
         };
         env.storage().persistent().set(&DataKey::Company(id), &info);
         env.storage()
@@ -512,6 +521,34 @@ impl PayrollRegistryTrait for PayrollRegistry {
         payroll_events::emit_company_registered(&env, id, admin, treasury);
 
         id
+    }
+
+    fn revoke_company_admin(env: Env, company_id: u64, admin: Address) {
+        Self::require_not_paused(&env);
+        let mut info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+
+        if admin != info.admin {
+            panic!("Unauthorized: caller is not the company admin");
+        }
+        admin.require_auth();
+
+        if info.revoked {
+            panic!("Company admin is already revoked");
+        }
+
+        info.revoked = true;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Company(company_id), &info);
+        env.storage()
+            .persistent()
+            .remove(&DataKey::CompanyAdmin(admin.clone()));
+
+        payroll_events::emit_company_admin_revoked(&env, company_id, admin);
     }
 
     fn add_employee(env: Env, company_id: u64, employee: Address, commitment: BytesN<32>) {
@@ -541,6 +578,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         info.admin.require_auth();
 
         let emp = employee.clone();
@@ -559,6 +599,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
 
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         info.admin.require_auth();
 
         let emp = employee.clone();
@@ -606,6 +649,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         info.admin.require_auth();
 
         if !env
@@ -694,6 +740,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         if current_admin != info.admin {
             panic!("Unauthorized: caller is not the company admin");
         }
@@ -728,6 +777,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
         if new_admin != proposal.new_holder {
             panic!("Unauthorized: caller is not the proposed admin");
+        }
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
         }
         new_admin.require_auth();
 
@@ -783,6 +840,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         if current_admin != info.admin {
             panic!("Unauthorized");
         }
@@ -813,6 +873,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         if current_admin != info.admin {
             panic!("Unauthorized: caller is not the company admin");
         }
@@ -851,6 +914,14 @@ impl PayrollRegistryTrait for PayrollRegistry {
 
         if new_treasury != proposal.new_holder {
             panic!("Unauthorized: caller is not the proposed treasury");
+        }
+        let info: CompanyInfo = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Company(company_id))
+            .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
         }
         new_treasury.require_auth();
 
@@ -904,6 +975,9 @@ impl PayrollRegistryTrait for PayrollRegistry {
             .persistent()
             .get(&DataKey::Company(company_id))
             .expect("Company not found");
+        if info.revoked {
+            panic!("Company admin is revoked");
+        }
         if current_admin != info.admin {
             panic!("Unauthorized");
         }
