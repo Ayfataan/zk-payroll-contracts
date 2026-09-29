@@ -3415,7 +3415,13 @@ impl Payroll {
         Self::record_payroll_run_state(&e, run_id, PayrollRunState::ReconciliationRequired);
 
         // Issue #485: Record payroll run status for dashboards
-        Self::record_payroll_run_status(&e, run_id, PayrollRunStatusKind::Completed, count, expected_total_spend);
+        Self::record_payroll_run_status(
+            &e,
+            run_id,
+            PayrollRunStatusKind::Completed,
+            count,
+            expected_total_spend,
+        );
 
         // Issue #478: Record metadata version for this run
         Self::set_metadata_version(&e, run_id, 1u32, BytesN::from_array(&e, &[0u8; 32]));
@@ -6689,7 +6695,11 @@ impl Payroll {
     ) {
         let tracker_key = DataKey::EmployeePaidTracker(run_id);
 
-        if let Some(tracker) = env.storage().persistent().get::<_, EmployeePaidTracker>(&tracker_key) {
+        if let Some(tracker) = env
+            .storage()
+            .persistent()
+            .get::<_, EmployeePaidTracker>(&tracker_key)
+        {
             for paid in tracker.paid_employees.iter() {
                 if paid == *employee_commitment {
                     panic!("Employee already paid in this run");
@@ -6704,14 +6714,14 @@ impl Payroll {
     /// - `env`: Soroban environment
     /// - `run_id`: The payroll run ID
     /// - `employee_commitment`: The employee's commitment hash
-    fn record_employee_paid(
-        env: &Env,
-        run_id: u64,
-        employee_commitment: BytesN<32>,
-    ) {
+    fn record_employee_paid(env: &Env, run_id: u64, employee_commitment: BytesN<32>) {
         let tracker_key = DataKey::EmployeePaidTracker(run_id);
 
-        let mut tracker = if let Some(existing) = env.storage().persistent().get::<_, EmployeePaidTracker>(&tracker_key) {
+        let mut tracker = if let Some(existing) = env
+            .storage()
+            .persistent()
+            .get::<_, EmployeePaidTracker>(&tracker_key)
+        {
             existing
         } else {
             EmployeePaidTracker {
@@ -6731,38 +6741,38 @@ impl Payroll {
     /// Returns a PayrollRunStatus struct with the current state, timestamps, and counts.
     pub fn get_payroll_run_status(env: Env, run_id: u64) -> Option<PayrollRunStatus> {
         // Check if a status is stored
-        if let Some(status) = env.storage().persistent().get::<_, PayrollRunStatus>(
-            &DataKey::PayrollRunStatus(run_id)
-        ) {
+        if let Some(status) = env
+            .storage()
+            .persistent()
+            .get::<_, PayrollRunStatus>(&DataKey::PayrollRunStatus(run_id))
+        {
             return Some(status);
         }
 
         // Fallback: derive status from PayrollRunState if no explicit status stored
-        if let Some(state) = env.storage().persistent().get::<_, PayrollRunState>(
-            &DataKey::PayrollState(run_id)
-        ) {
-            if let Some(run) = env.storage().persistent().get::<_, PayrollRun>(
-                &DataKey::PayrollRun(run_id)
-            ) {
+        if let Some(state) = env
+            .storage()
+            .persistent()
+            .get::<_, PayrollRunState>(&DataKey::PayrollState(run_id))
+        {
+            if let Some(run) = env
+                .storage()
+                .persistent()
+                .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
+            {
                 let status_kind = match state {
-                    PayrollRunState::Draft | PayrollRunState::Validating | PayrollRunState::ProofPending => {
-                        PayrollRunStatusKind::Pending
-                    }
+                    PayrollRunState::Draft
+                    | PayrollRunState::Validating
+                    | PayrollRunState::ProofPending => PayrollRunStatusKind::Pending,
                     PayrollRunState::ReadyToSubmit | PayrollRunState::Submitted => {
                         PayrollRunStatusKind::Approved
                     }
-                    PayrollRunState::Confirming => {
-                        PayrollRunStatusKind::Executing
-                    }
-                    PayrollRunState::Completed => {
-                        PayrollRunStatusKind::Completed
-                    }
+                    PayrollRunState::Confirming => PayrollRunStatusKind::Executing,
+                    PayrollRunState::Completed => PayrollRunStatusKind::Completed,
                     PayrollRunState::Failed | PayrollRunState::ReconciliationRequired => {
                         PayrollRunStatusKind::Failed
                     }
-                    PayrollRunState::Cancelled => {
-                        PayrollRunStatusKind::Failed
-                    }
+                    PayrollRunState::Cancelled => PayrollRunStatusKind::Failed,
                 };
 
                 return Some(PayrollRunStatus {
@@ -6795,10 +6805,9 @@ impl Payroll {
             total_amount,
         };
 
-        env.storage().persistent().set(
-            &DataKey::PayrollRunStatus(run_id),
-            &status_record,
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::PayrollRunStatus(run_id), &status_record);
     }
 
     // ── Issue #478: Payroll run metadata versioning ────────────────────────────
@@ -6823,10 +6832,9 @@ impl Payroll {
             metadata_hash,
         };
 
-        env.storage().persistent().set(
-            &DataKey::PayrollRunMetadataVersion(run_id),
-            &version_record,
-        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::PayrollRunMetadataVersion(run_id), &version_record);
     }
 
     /// Get metadata version for a payroll run.
@@ -6838,7 +6846,9 @@ impl Payroll {
     /// # Returns
     /// The metadata version record if it exists
     pub fn get_metadata_version(env: Env, run_id: u64) -> Option<PayrollRunMetadataVersion> {
-        env.storage().persistent().get(&DataKey::PayrollRunMetadataVersion(run_id))
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayrollRunMetadataVersion(run_id))
     }
 
     // ── Issue #476: Contract-level payroll currency validation ──────────────────
@@ -7241,46 +7251,37 @@ impl Payroll {
             split_by: admin.clone(),
         };
 
-        e.storage().persistent().set(
-            &DataKey::BatchSplitRecord(parent_run_id, child_run_id),
-            &split_record,
-        );
-
-        e.events().publish(
-            (Symbol::new(&e, "BatchSplitRecorded"), parent_run_id),
-            (child_run_id, child_total, e.ledger().timestamp()),
-        );
-    }
-
-    /// Get batch split record by parent and child run IDs (#352).
-    pub fn get_batch_split(
-        e: Env,
-        parent_run_id: u64,
-        child_run_id: u64,
-    ) -> Option<BatchSplitRecord> {
-        e.storage()
+        env.storage()
             .persistent()
-            .get(&DataKey::BatchSplitRecord(parent_run_id, child_run_id))
+            .set(&DataKey::PayrollCurrencyConfig, &config);
+
+        env.events().publish((symbol_short!("currencies"),), config);
     }
 
-    /// Validate that a batch split preserves the original aggregate commitment (#352).
-    /// This ensures that when a large batch is split, the sum of children equals the parent.
-    pub fn validate_batch_split_aggregate(
-        e: Env,
-        parent_run_id: u64,
-        expected_total_amount: i128,
-        expected_employee_count: u32,
-    ) -> bool {
-        let parent_run_key = DataKey::PayrollRun(parent_run_id);
-        if let Some(parent_run) = e
+    /// Get the configured payroll currency for this contract.
+    pub fn get_payroll_currency(env: Env) -> Option<PayrollCurrencyConfig> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::PayrollCurrencyConfig)
+    }
+
+    /// Validate that the asset being used for payroll matches the configured currency.
+    ///
+    /// # Arguments
+    /// - `env`: Soroban environment
+    /// - `asset`: The asset to validate
+    ///
+    /// # Panics
+    /// If the asset does not match the configured payroll currency.
+    fn validate_payroll_currency(env: &Env, asset: &Address) -> Result<(), PaymentError> {
+        if let Some(config) = env
             .storage()
             .persistent()
-            .get::<DataKey, PayrollRun>(&parent_run_key)
+            .get::<_, PayrollCurrencyConfig>(&DataKey::PayrollCurrencyConfig)
         {
-            parent_run.total_amount == expected_total_amount
-                && parent_run.employee_count == expected_employee_count
-        } else {
-            false
+            if config.asset != *asset {
+                return Err(PaymentError::InvalidAsset);
+            }
         }
     }
 }
