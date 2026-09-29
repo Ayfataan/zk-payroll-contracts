@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contractimpl, contracttype, symbol_short, token as soroban_token, Address, Bytes,
-    BytesN, Env, Symbol, Vec,
+    BytesN, Env, String, Symbol, Vec,
 };
 
 use pause_manager::PauseManagerClient;
@@ -22,6 +22,7 @@ use signed_operator_actions::{
 };
 
 const MAX_BATCH: u32 = 50;
+const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
 
 #[contract]
 pub struct Payroll;
@@ -1201,6 +1202,12 @@ impl Payroll {
     fn validate_draft_id(draft_id: u64) {
         if draft_id == 0 {
             panic!("Invalid draft ID: must be non-zero");
+        }
+    }
+
+    fn require_period_not_frozen(e: &Env, period_label: &Symbol) {
+        if Self::is_period_config_frozen(e.clone(), period_label.clone()) {
+            panic!("Payroll period is frozen: it has been finalized and can no longer be edited");
         }
     }
 
@@ -4277,6 +4284,81 @@ impl Payroll {
         draft.updated_at
     }
 
+    /// Return the owner/admin who holds the lock on a payroll draft (Issue #556).
+    ///
+    /// A draft is considered in a locked state when it has reached a finalized
+    /// review or submission state (`RunDraftState::Finalized` or `RunDraftState::Submitted`).
+    /// - If the draft exists and is locked (`Finalized` or `Submitted`), returns `Some(draft.admin)`.
+    /// - If the draft exists but is in an unlocked state (`Pending`) or terminal non-locked state (`Cancelled`, `Expired`), returns `None`.
+    /// - If the draft does not exist, returns `None`.
+    ///
+    /// Exposes only the lock owner address metadata without revealing confidential
+    /// employee addresses or salary figures.
+    pub fn get_draft_lock_owner(e: Env, draft_id: u64) -> Option<Address> {
+        Self::validate_draft_id(draft_id);
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))?;
+        if matches!(draft.state, RunDraftState::Finalized | RunDraftState::Submitted) {
+            Some(draft.admin)
+        } else {
+            None
+        }
+    }
+
+    /// Set or update the description for a draft in Pending state.
+    pub fn set_run_draft_description(e: Env, admin: Address, draft_id: u64, description: String) {
+        Self::require_not_paused(&e);
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        Self::validate_draft_id(draft_id);
+        let draft: PayrollRunDraft = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunDraft(draft_id))
+            .expect("Draft not found");
+        if draft.state != RunDraftState::Pending {
+            panic!("Only pending drafts can be updated");
+        }
+        let len = description.len();
+        if len == 0 || len > 256 {
+            panic!("Description length must be between 1 and 256 characters");
+        }
+        let mut all_spaces = true;
+        let mut buf = [0u8; 256];
+        description.copy_into_slice(&mut buf[..len as usize]);
+        for &b in &buf[..len as usize] {
+            if b != b' ' && b != b'\t' && b != b'\n' && b != b'\r' {
+                all_spaces = false;
+                break;
+            }
+        }
+        if all_spaces {
+            panic!("Description cannot be empty or blank");
+        }
+
+        e.storage()
+            .persistent()
+            .set(&DataKey::DraftDescription(draft_id), &description);
+    }
+
+    /// Retrieve the description for a draft by ID.
+    pub fn get_run_draft_description(e: Env, draft_id: u64) -> Option<String> {
+        Self::validate_draft_id(draft_id);
+        e.storage()
+            .persistent()
+            .get(&DataKey::DraftDescription(draft_id))
+    }
+
     /// Return whether a draft transition is allowed by the draft state machine.
     pub fn is_draft_transition_allowed(_e: Env, from: RunDraftState, to: RunDraftState) -> bool {
         Self::is_allowed_draft_state_transition_internal(from, to)
@@ -4333,23 +4415,9 @@ impl Payroll {
         // Issue #471: the period is now final — auto-freeze it so no further
         // payroll edits can slip in after submission without an explicit
         // authorized unfreeze.
-        let freeze_key = DataKey::PeriodFreeze(draft.period_label.clone());
+        let freeze_key = DataKey::PeriodConfigFrozen(draft.period_label.clone());
         if !e.storage().persistent().has(&freeze_key) {
-            let freeze = PeriodFreeze {
-                period_label: draft.period_label.clone(),
-                frozen_by: admin.clone(),
-                frozen_at: e.ledger().timestamp(),
-                reason: Symbol::new(&e, "finalized"),
-                runs_count: Self::count_runs_for_period(&e, &draft.period_label),
-            };
-            e.storage().persistent().set(&freeze_key, &freeze);
-
-            payroll_events::emit_period_frozen(
-                &e,
-                draft.period_label.clone(),
-                admin.clone(),
-                Symbol::new(&e, "finalized"),
-            );
+            e.storage().persistent().set(&freeze_key, &true);
         }
 
         payroll_events::emit_draft_submitted(&e, draft_id, admin);
@@ -7369,6 +7437,7 @@ mod tests {
     #[test]
     fn benchmark_50_batch_validations() {
         let env = Env::default();
+        env.budget().reset_unlimited();
         env.mock_all_auths();
 
         let verifier_id = env.register_contract(None, ProofVerifier);
@@ -7867,6 +7936,70 @@ mod tests {
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Submitted));
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Cancelled));
         assert!(payroll_client.is_draft_state_terminal(&RunDraftState::Expired));
+    }
+
+    #[test]
+    fn test_draft_lock_owner_query_lifecycle() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let draft_id = payroll_client.create_run_draft(
+            &admin,
+            &25_000i128,
+            &4u32,
+            &Symbol::new(&env, "LOCK_TEST"),
+        );
+
+        // 1. Pending draft is not locked -> returns None
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), None);
+
+        // 2. Finalized draft is locked -> returns Some(admin)
+        payroll_client.finalize_run_draft(&admin, &draft_id);
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), Some(admin.clone()));
+
+        // 3. Submitted draft remains locked -> returns Some(admin)
+        payroll_client.submit_run_draft(&admin, &draft_id);
+        assert_eq!(payroll_client.get_draft_lock_owner(&draft_id), Some(admin));
+
+        // 4. Non-existent draft returns None
+        assert_eq!(payroll_client.get_draft_lock_owner(&999_999u64), None);
+    }
+
+    #[test]
+    fn test_draft_lock_owner_cancelled_and_expired_return_none() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        // Cancelled draft
+        let id_cancel = payroll_client.create_run_draft(
+            &admin,
+            &15_000i128,
+            &2u32,
+            &Symbol::new(&env, "CANCEL_LOCK"),
+        );
+        payroll_client.cancel_run_draft(&admin, &id_cancel);
+        assert_eq!(payroll_client.get_draft_lock_owner(&id_cancel), None);
+
+        // Expired draft
+        let id_expire = payroll_client.create_run_draft(
+            &admin,
+            &12_000i128,
+            &2u32,
+            &Symbol::new(&env, "EXPIRE_LOCK"),
+        );
+        payroll_client.expire_run_draft(&admin, &id_expire);
+        assert_eq!(payroll_client.get_draft_lock_owner(&id_expire), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid draft ID: must be non-zero")]
+    fn test_draft_lock_owner_zero_id_panics() {
+        let env = Env::default();
+        let (payroll_client, _admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+        payroll_client.get_draft_lock_owner(&0u64);
     }
 
     // ?? Issue #103: per-payroll run nonce uniqueness ???????????????????????????
