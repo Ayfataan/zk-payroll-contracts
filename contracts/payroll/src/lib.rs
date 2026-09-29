@@ -410,6 +410,8 @@ pub enum ReviewDecision {
     Approved = 0,
     Rejected = 1,
     ChangesRequested = 2,
+    /// Approval was retracted by the reviewer that granted it (#522).
+    Withdrawn = 3,
 }
 
 /// A review record submitted by an authorized reviewer.
@@ -479,8 +481,7 @@ pub struct Dispute {
     pub resolution_reason: Option<Symbol>,
 }
 
-// ── Issue #338: per-period payroll capacity limits ─────────────────
-
+// ── Issue #338: per-period payroll capacity limits ─────────
 /// Employer-configured capacity limits enforced per payroll period.
 ///
 /// Limits are opt-in: if no policy has been set via `set_capacity_limits`,
@@ -518,8 +519,7 @@ pub enum CapacityLimitKind {
     TotalValue = 2,
 }
 
-// ── Issue #316: settlement window enforcement ───────────────────────────────
-
+// ── Issue #316: settlement window enforcement ───────────────────────
 /// Employer-configured settlement window for a payroll period.
 ///
 /// Timestamps are ledger (unix) time, consistent with `env.ledger().timestamp()`
@@ -572,8 +572,7 @@ pub enum SettlementWindowStatus {
     Closed = 3,
 }
 
-// ── Issue #248: payroll period configuration freeze guard ───────────────────
-
+// ── Issue #248: payroll period configuration freeze guard ───────────
 /// Freeze state of a payroll period's configuration.
 ///
 /// A period's configuration (currently its settlement window) may be edited
@@ -590,8 +589,27 @@ pub enum PeriodConfigState {
     Frozen = 1,
 }
 
-// ── Issue #482: Duplicate employee entry validation ──────────────────────────
+/// Audit record captured when a period is frozen at draft submission (#471).
+///
+/// Privacy-safe: carries only the period label, the authorizing admin, a
+/// short reason symbol, and the number of associated runs — never salary
+/// values or employee data.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PeriodFreeze {
+    /// The period that was frozen.
+    pub period_label: Symbol,
+    /// Admin that authorized the freeze (or the auto-freeze actor).
+    pub frozen_by: Address,
+    /// Ledger timestamp of the freeze.
+    pub frozen_at: u64,
+    /// Short human-readable reason for the freeze.
+    pub reason: Symbol,
+    /// Number of finalized runs associated with the period at freeze time.
+    pub runs_count: u32,
+}
 
+// ── Issue #482: Duplicate employee entry validation ──────────────────
 /// Tracks which employees have been paid in a payroll run to prevent duplicates.
 /// Maps run_id to a Vec of employee identifiers (commitment hashes).
 #[contracttype]
@@ -601,8 +619,7 @@ pub struct EmployeePaidTracker {
     pub paid_employees: Vec<BytesN<32>>,
 }
 
-// ── Issue #485: Payroll run status query helper ───────────────────────────────
-
+// ── Issue #485: Payroll run status query helper ───────────────────────
 /// Concise status view of a payroll run for dashboard and client views.
 #[contracttype]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -705,8 +722,7 @@ pub struct PayrollRunMetadataVersion {
     pub metadata_hash: BytesN<32>,
 }
 
-// ── Issue #476: Contract-level payroll currency validation ──────────────────────
-
+// ── Issue #476: Contract-level payroll currency validation ──────────────
 /// Currency configuration for a payroll contract to enforce consistent asset usage.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -1612,14 +1628,17 @@ impl Payroll {
         }
     }
 
-    fn validate_draft_description(description: &String) {
+    /// Maximum serialized size accepted for a draft description (#474).
+    const MAX_DRAFT_DESCRIPTION_BYTES: u32 = 256;
+
+    fn validate_draft_description(description: &soroban_sdk::String) {
         if description.is_empty() {
             panic!("Description cannot be blank");
         }
-        if description.len() > MAX_DRAFT_DESCRIPTION_BYTES {
+        if description.len() > Self::MAX_DRAFT_DESCRIPTION_BYTES {
             panic!("Description exceeds 256 bytes");
         }
-        let mut bytes = [0u8; MAX_DRAFT_DESCRIPTION_BYTES as usize];
+        let mut bytes = [0u8; Self::MAX_DRAFT_DESCRIPTION_BYTES as usize];
         description.copy_into_slice(&mut bytes[..description.len() as usize]);
         let mut has_non_whitespace = false;
         for byte in bytes.iter().take(description.len() as usize) {
@@ -8247,36 +8266,37 @@ impl Payroll {
             .get(&DataKey::ArchiveMarker(run_id))
     }
 
-    // ?? Issue #401: Batch Lock Timestamp Query Helper ????????????????????????
-
-    /// Return the timestamp at which a payroll batch reached locked state (#401).
+    /// Validate that a period is suitable for cloning/templating.
     ///
-    /// A batch is in a locked state when funds have been reserved and it is awaiting
-    /// execution or has already been executed.
-    /// - If the batch is in a pending run state (`PendingRun(run_id)`), its `prepared_at` timestamp is returned.
-    /// - If the batch has been executed (`PayrollRun(run_id)`), its `executed_at` timestamp is returned.
-    /// - If the batch does not exist or has not been locked, `None` is returned.
-    pub fn get_batch_lock_timestamp(e: Env, run_id: u64) -> Option<u64> {
-        if let Some(pending) = e
+    /// Checks:
+    /// - Period configuration is not frozen
+    /// - Settlement window exists
+    ///
+    /// Returns Ok(()) if valid, panics with actionable message otherwise.
+    /// Privacy-safe: does not expose salary amounts or employee data.
+    fn validate_period_for_cloning(e: Env, period: Symbol) -> Result<(), ()> {
+        Self::validate_symbol_not_empty(&e, &period, "period");
+
+        // Check if period is frozen
+        if Self::is_period_config_frozen(e.clone(), period.clone()) {
+            panic!("Source period is frozen and cannot be used as a template");
+        }
+
+        // Verify settlement window exists
+        if !e
             .storage()
             .persistent()
-            .get::<_, PendingPayrollRun>(&DataKey::PendingRun(run_id))
+            .has(&DataKey::SettlementWindow(period.clone()))
         {
-            return Some(pending.prepared_at);
+            panic!("Source period has no settlement window configured");
         }
-        if let Some(run) = e
-            .storage()
-            .persistent()
-            .get::<_, PayrollRun>(&DataKey::PayrollRun(run_id))
-        {
-            return Some(run.executed_at);
-        }
-        None
+
+        Ok(())
     }
 
-    // ?? Issue #402: Safe Treasury Balance Summary View ???????????????????????
-
-    /// Return aggregate treasury balance summary for a given asset token (#402).
+    // ────────────────────────────────────────────────────────────    // Issue #512: Draft Checksum Verification Enhancement
+    // ────────────────────────────────────────────────────────────
+    /// Verify draft checksum matches between preparation and finalization.
     ///
     /// Returns the total balance held at the treasury address, the reserved/locked
     /// balance allocated to pending payroll runs, blocked balances, and the net
@@ -8286,23 +8306,11 @@ impl Payroll {
         let addrs: ContractAddresses = e
             .storage()
             .persistent()
-            .get(&DataKey::Addresses)
-            .expect("Not initialized");
-        let total_balance = soroban_token::Client::new(&e, &asset).balance(&addrs.treasury);
-        let reserved_balance = Self::get_locked_funds(e.clone(), asset.clone());
-        let blocked_balance = 0i128;
-        let available_balance = total_balance
-            .checked_sub(reserved_balance)
-            .unwrap_or(0i128)
-            .checked_sub(blocked_balance)
-            .unwrap_or(0i128);
+            .get(&DataKey::PendingRun(run_id))
+            .expect("Pending run not found");
 
-        SafeTreasurySummary {
-            asset,
-            total_balance,
-            available_balance,
-            reserved_balance,
-            blocked_balance,
+        if pending_run.draft_hash != provided_hash {
+            panic!("Draft checksum mismatch: payroll data was modified after review");
         }
     }
 
@@ -8365,19 +8373,7 @@ impl Payroll {
 
     // ?? Issue #403: Payroll Approval Expiry Validation ???????????????????????
 
-    /// Check whether an approval for a payroll run has expired (#403).
-    ///
-    /// Returns `true` if a review exists with decision `Approved` but `current_timestamp > reviewed_at + max_age_seconds`.
-    /// Returns `false` if the approval is within the validity window or if no approval exists.
-    pub fn is_payroll_approval_expired(e: Env, run_id: u64, max_age_seconds: u64) -> bool {
-        if let Some(review) = Self::get_run_review(e.clone(), run_id) {
-            if review.decision == ReviewDecision::Approved {
-                let current_time = e.ledger().timestamp();
-                let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
-                return current_time > expiry_time;
-            }
-        }
-        false
+        Ok(())
     }
 
     /// Validate that a payroll run approval is active and not expired (#403).
@@ -8911,8 +8907,8 @@ mod tests {
     use pause_manager::{PauseManager, PauseManagerClient};
     use proof_verifier::{ProofVerifier, VerificationKey};
     use salary_commitment::SalaryCommitmentContract;
-    use soroban_sdk::testutils::{Address as _, Ledger as _};
-    use soroban_sdk::{Env, IntoVal};
+    use soroban_sdk::testutils::{Address as _, Events as _, Ledger as _};
+    use soroban_sdk::{Env, IntoVal, TryFromVal};
     use token::{Token, TokenClient};
 
     fn mock_proof(env: &Env) -> BytesN<256> {
@@ -8924,6 +8920,26 @@ mod tests {
         let mut arr = [0u8; 32];
         arr[0] = seed;
         BytesN::from_array(env, &arr)
+    }
+
+    /// Returns the topics and data (as `ScVal`s) of the last contract event
+    /// published in this environment, decoded from the SDK 28 XDR event
+    /// stream.
+    fn last_event_scval(
+        env: &Env,
+    ) -> (
+        soroban_sdk::xdr::VecM<soroban_sdk::xdr::ScVal>,
+        soroban_sdk::xdr::ScVal,
+    ) {
+        let events = env.events().all();
+        let last = events
+            .events()
+            .last()
+            .expect("expected at least one published event");
+        let v0 = match &last.body {
+            soroban_sdk::xdr::ContractEventBody::V0(v0) => v0,
+        };
+        (v0.topics.clone(), v0.data.clone())
     }
 
     fn mock_vk(env: &Env) -> VerificationKey {
@@ -9013,6 +9029,11 @@ mod tests {
         let env = Env::default();
         env.budget().reset_unlimited();
         env.mock_all_auths();
+        // A 50-employee batch plus its per-employee events exceeds the
+        // mainnet-sized invocation resource limits enforced by default in the
+        // SDK 28 test environment (e.g. 16 KB of events). This is a benchmark
+        // measuring work done, not a limit test, so disable enforcement.
+        env.cost_estimate().disable_resource_limits();
 
         let verifier_id = env.register_contract(None, ProofVerifier);
         let verifier_client = ProofVerifierClient::new(&env, &verifier_id);
@@ -11456,6 +11477,229 @@ mod tests {
         );
 
         payroll_client.approve_payroll_run(&unauthorized, &run_id);
+    }
+
+    // ?? Issue #522: approval withdrawal & supersession tests ????????????????
+
+    #[test]
+    fn test_withdraw_approval_records_decision_and_event() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 150),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+        let reason = Symbol::new(&env, "salary_error");
+        payroll_client.withdraw_approval(&reviewer, &run_id, &reason);
+
+        // The withdrawal event must be privacy-safe: only the opaque run id,
+        // the withdrawing reviewer, and the reason symbol — no amounts or
+        // employee data. Captured from the withdrawal invocation itself, since
+        // the SDK event stream only covers the last contract invocation.
+        let (topics, data) = last_event_scval(&env);
+
+        let review = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing after withdrawal");
+        assert_eq!(review.decision, ReviewDecision::Withdrawn);
+        assert_eq!(review.reviewer, reviewer);
+        assert_eq!(review.reason, reason);
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics[0]).unwrap(),
+            Symbol::new(&env, "payroll")
+        );
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics[1]).unwrap(),
+            Symbol::new(&env, "run_approval_withdrawn")
+        );
+        let fields = match data {
+            soroban_sdk::xdr::ScVal::Vec(Some(v)) => v.to_vec(),
+            other => panic!("unexpected withdrawal event data shape: {other:?}"),
+        };
+        let run_id_decoded = match &fields[0] {
+            soroban_sdk::xdr::ScVal::U64(v) => *v,
+            other => panic!("unexpected withdrawal run id field: {other:?}"),
+        };
+        assert_eq!(run_id_decoded, run_id);
+        assert_eq!(Address::try_from_val(&env, &fields[1]).unwrap(), reviewer);
+        assert_eq!(Symbol::try_from_val(&env, &fields[2]).unwrap(), reason);
+    }
+
+    #[test]
+    fn test_supersede_approval_transfers_and_emits_event() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer_a = Address::generate(&env);
+        let reviewer_b = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer_a);
+        payroll_client.add_reviewer(&admin, &reviewer_b);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 151),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer_a, &run_id);
+        let original = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing")
+            .reviewed_at;
+
+        // Advance time so supersession demonstrably restarts the #403 expiry
+        // window from the new `reviewed_at`.
+        env.ledger().with_mut(|li| li.timestamp += 1_000);
+        payroll_client.supersede_approval(&reviewer_b, &run_id);
+
+        // The supersession event names the previous and new reviewers.
+        // Captured from the supersession invocation itself, since the SDK
+        // event stream only covers the last contract invocation.
+        let (topics, data) = last_event_scval(&env);
+
+        let review = payroll_client
+            .get_run_review(&run_id)
+            .expect("Review record missing after supersession");
+        assert_eq!(review.decision, ReviewDecision::Approved);
+        assert_eq!(review.reviewer, reviewer_b);
+        assert!(
+            review.reviewed_at > original,
+            "supersession must refresh the approval timestamp"
+        );
+        assert_eq!(topics.len(), 2);
+        assert_eq!(
+            Symbol::try_from_val(&env, &topics[1]).unwrap(),
+            Symbol::new(&env, "run_approval_superseded")
+        );
+        let fields = match data {
+            soroban_sdk::xdr::ScVal::Vec(Some(v)) => v.to_vec(),
+            other => panic!("unexpected supersession event data shape: {other:?}"),
+        };
+        let run_id_decoded = match &fields[0] {
+            soroban_sdk::xdr::ScVal::U64(v) => *v,
+            other => panic!("unexpected supersession run id field: {other:?}"),
+        };
+        assert_eq!(run_id_decoded, run_id);
+        assert_eq!(Address::try_from_val(&env, &fields[1]).unwrap(), reviewer_a);
+        assert_eq!(Address::try_from_val(&env, &fields[2]).unwrap(), reviewer_b);
+    }
+
+    #[test]
+    #[should_panic(expected = "Symbol cannot be empty")]
+    fn test_withdraw_approval_requires_non_empty_reason() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 152),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+        payroll_client.withdraw_approval(&reviewer, &run_id, &Symbol::new(&env, ""));
+    }
+
+    #[test]
+    #[should_panic(expected = "Only the approving reviewer may withdraw an approval")]
+    fn test_other_reviewer_cannot_withdraw_someone_elses_approval() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer_a = Address::generate(&env);
+        let reviewer_b = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer_a);
+        payroll_client.add_reviewer(&admin, &reviewer_b);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 153),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer_a, &run_id);
+        // B is a valid reviewer, but A owns the active approval.
+        payroll_client.withdraw_approval(&reviewer_b, &run_id, &Symbol::new(&env, "policy"));
+    }
+
+    #[test]
+    #[should_panic(expected = "No active approval to withdraw")]
+    fn test_cannot_withdraw_an_already_withdrawn_approval() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 154),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+        payroll_client.withdraw_approval(&reviewer, &run_id, &Symbol::new(&env, "policy"));
+        payroll_client.withdraw_approval(&reviewer, &run_id, &Symbol::new(&env, "again"));
+    }
+
+    #[test]
+    #[should_panic(expected = "Superseding reviewer must differ from the current approver")]
+    fn test_cannot_supersede_own_approval() {
+        let env = Env::default();
+        let (payroll_client, admin, _treasury, _treasury_owner, employee) =
+            setup_simple_payroll(&env);
+
+        let reviewer = Address::generate(&env);
+        payroll_client.add_reviewer(&admin, &reviewer);
+
+        let (proofs, amounts, employees) = single_payment_batch(&env, &employee, 1000);
+        let run_id = payroll_client.prepare_payroll_run(
+            &proofs,
+            &amounts,
+            &employees,
+            &1000,
+            &test_nonce(&env, 155),
+            &None,
+        );
+
+        payroll_client.approve_payroll_run(&reviewer, &run_id);
+        payroll_client.supersede_approval(&reviewer, &run_id);
     }
 
     #[test]
